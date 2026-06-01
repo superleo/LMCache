@@ -2579,6 +2579,46 @@ class HipFileMemoryAllocator(GPUMemoryAllocator):
         return "HipFileMemoryAllocator"
 
 
+class MuFileMemoryAllocator(GPUMemoryAllocator):
+    """GDS allocator for Moore Threads MUSA via the ``mufile`` Python package.
+
+    Structurally identical to ``CuFileMemoryAllocator`` /
+    ``HipFileMemoryAllocator``: lazy import of the vendor bindings keeps
+    hosts without the MUSA stack from paying an import-time cost; the
+    underlying ``GPUMemoryAllocator`` pool is registered with ``mufile`` so
+    later ``mufile``-backed read/write calls can do direct GPU I/O.
+
+    The binding names follow the same ``cu*`` → ``mu*`` substitution that
+    ``hipfile`` uses (``cuFileBufRegister`` → ``hipFileBufRegister`` →
+    ``muFileBufRegister``); class-level entry points such as ``CuFile`` /
+    ``CuFileDriver`` are expected to be re-exported under the same names
+    for drop-in source compatibility (``hipfile`` already does this).
+    """
+
+    def __init__(self, size: int, device=None):
+        # HACK: mufile import is placed here to avoid import errors on
+        # hardware without the Moore Threads stack.
+        # Third Party
+        from mufile.bindings import muFileBufDeregister, muFileBufRegister
+
+        self.muFileBufDeregister = muFileBufDeregister
+        if device is None:
+            if torch_dev.is_available():
+                device = f"{torch_device_type}:{torch_dev.current_device()}"
+            else:
+                device = "cpu:0"
+
+        super().__init__(size, device, align_bytes=4096)
+        self.base_pointer = self.tensor.data_ptr()
+        muFileBufRegister(ctypes.c_void_p(self.base_pointer), size, flags=0)
+
+    def __del__(self):
+        self.muFileBufDeregister(ctypes.c_void_p(self.base_pointer))
+
+    def __str__(self):
+        return "MuFileMemoryAllocator"
+
+
 class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
     """
     Paged Memory Allocator for both CPU and GPU memory.
@@ -2678,3 +2718,125 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
 
     def __str__(self):
         return "PDMemoryAllocator"
+
+
+class MUSAMemoryAllocator(MemoryAllocatorInterface):
+    """Allocates memory in the pre-allocated MUSA device memory."""
+
+    def __init__(
+        self,
+        size: int,
+        device="musa",
+        align_bytes: Optional[int] = None,
+        use_paging: bool = False,
+        **kwargs,
+    ):
+        self.tensor = torch.empty((size,), dtype=torch.uint8, device=device)
+
+        self.allocator: MemoryAllocatorInterface
+        if use_paging:
+            assert "shapes" in kwargs, (
+                "shapes must be specified for paged memory allocator"
+            )
+            assert "dtypes" in kwargs, (
+                "dtypes must be specified for paged memory allocator"
+            )
+            assert "fmt" in kwargs, "fmt must be specified for paged memory allocator"
+            self.allocator = PagedTensorMemoryAllocator(
+                tensor=self.tensor,
+                shapes=kwargs["shapes"],
+                dtypes=kwargs["dtypes"],
+                fmt=kwargs["fmt"],
+            )
+        else:
+            alloc_kwargs = {}
+            if align_bytes is not None:
+                alloc_kwargs["align_bytes"] = align_bytes
+            self.allocator = TensorMemoryAllocator(self.tensor, **alloc_kwargs)
+
+        self.device_mem_lock = threading.Lock() if not use_paging else nullcontext()
+
+    @_lmcache_nvtx_annotate
+    def allocate(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        allocator_type: Optional[str] = None,
+    ) -> Optional[MemoryObj]:
+        """Allocate a MemoryObj from the MUSA memory pool.
+
+        Args:
+            shapes: Shape(s) of the tensor(s) to allocate.
+            dtypes: Dtype(s) of the tensor(s).
+            fmt: Memory format for the allocation.
+            allocator_type: Optional label for debugging.
+
+        Returns:
+            A MemoryObj backed by MUSA device memory, or None on failure.
+        """
+        with self.device_mem_lock:
+            return self.allocator.allocate(shapes, dtypes, fmt, str(self))
+
+    @_lmcache_nvtx_annotate
+    def batched_allocate(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        allocator_type: Optional[str] = None,
+    ) -> Optional[List[MemoryObj]]:
+        """Allocate a batch of MemoryObjs from the MUSA memory pool.
+
+        Args:
+            shapes: Shape(s) of the tensor(s) to allocate.
+            dtypes: Dtype(s) of the tensor(s).
+            batch_size: Number of MemoryObjs to allocate.
+            fmt: Memory format for the allocation.
+            allocator_type: Optional label for debugging.
+
+        Returns:
+            A list of MemoryObjs, or None on failure.
+        """
+        with self.device_mem_lock:
+            return self.allocator.batched_allocate(
+                shapes, dtypes, batch_size, fmt, str(self)
+            )
+
+    def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):
+        """Free a previously allocated MemoryObj.
+
+        Args:
+            memory_obj: The MemoryObj to release back to the pool.
+            allocator_type: Optional label for debugging.
+        """
+        with self.device_mem_lock:
+            self.allocator.free(memory_obj)
+
+    def batched_free(
+        self,
+        memory_objs: List[MemoryObj],
+        allocator_type: Optional[str] = None,
+        update_stats: bool = True,
+    ):
+        """Free a batch of previously allocated MemoryObjs.
+
+        Args:
+            memory_objs: List of MemoryObjs to release.
+            allocator_type: Optional label for debugging.
+            update_stats: Whether to update internal statistics.
+        """
+        with self.device_mem_lock:
+            self.allocator.batched_free(memory_objs)
+
+    def memcheck(self):
+        with self.device_mem_lock:
+            return self.allocator.memcheck()
+
+    def close(self):
+        if hasattr(torch, "musa") and torch.musa.is_available():  # type: ignore[attr-defined]
+            torch.musa.synchronize()  # type: ignore[attr-defined]
+
+    def __str__(self):
+        return "MUSAMemoryAllocator"

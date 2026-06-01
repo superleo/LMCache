@@ -38,7 +38,7 @@ from lmcache.v1.memory_management import (
     MemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.storage_backend import CreateStorageBackends, is_cuda_worker
+from lmcache.v1.storage_backend import CreateStorageBackends, is_gpu_worker
 from lmcache.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
     StorageBackendInterface,
@@ -269,7 +269,7 @@ class StorageManager:
         self.async_serializer: Optional[AsyncSerializer] = None
 
         # The GPU stream for internal copies during put
-        if is_cuda_worker(metadata):
+        if is_gpu_worker(metadata):
             self.internal_copy_stream = torch_dev.Stream()
         else:
             self.internal_copy_stream = None
@@ -1278,7 +1278,7 @@ class StorageManager:
                 self.metadata,
                 self.loop,
                 dst_device=(
-                    torch_device_type if is_cuda_worker(self.metadata) else "cpu"
+                    torch_device_type if is_gpu_worker(self.metadata) else "cpu"
                 ),
                 lmcache_worker=self.lmcache_worker,
                 skip_backends=existing_names,
@@ -1342,7 +1342,7 @@ class StorageManager:
                 self.metadata,
                 self.loop,
                 dst_device=(
-                    torch_device_type if is_cuda_worker(self.metadata) else "cpu"
+                    torch_device_type if is_gpu_worker(self.metadata) else "cpu"
                 ),
                 lmcache_worker=self.lmcache_worker,
                 skip_backends=existing_names,

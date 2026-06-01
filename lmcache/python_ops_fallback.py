@@ -32,16 +32,37 @@ _copy_lib_NOT_LOADED = object()
 _copy_lib: Optional[ctypes.CDLL] = _copy_lib_NOT_LOADED  # type: ignore
 
 
+# Candidate GPU runtime libraries for pointer-mode memcpy, in priority order.
+# CUDA wins on dual-stack hosts; HIP is the AMD/ROCm fork; MUSA is the Moore
+# Threads fork. Symbol naming follows the vendor convention:
+#   - CUDA: ``cudaMemcpy``  in ``libcudart.so``
+#   - HIP:  ``hipMemcpy``   in ``libamdhip64.so``
+#   - MUSA: ``musaMemcpy``  in ``libmusart.so``
+# The same mapping lives in ``lmcache/v1/storage_backend/gds_backend.py`` as
+# ``_POSIX_RUNTIME_SYMBOLS`` for the storage-side POSIX fallback; keep them in
+# sync when a new accelerator is added.
+_GPU_RUNTIME_LIBRARIES: tuple[tuple[str, str], ...] = (
+    ("cudart", "libcudart.so"),  # NVIDIA CUDA Runtime
+    ("amdhip64", "libamdhip64.so"),  # AMD ROCm HIP Runtime
+    ("musart", "libmusart.so"),  # Moore Threads MUSA Runtime
+)
+
+
 def _get_copy_lib() -> Optional[ctypes.CDLL]:
-    """Lazily load and cache the CUDA/ROCm runtime library, or None for CPU fallback."""
+    """Lazily load and cache the GPU runtime library, or None for CPU fallback.
+
+    Tries CUDA → ROCm → MUSA in order so the first successfully-loaded
+    library wins. On a MUSA-only host (no CUDA, no ROCm) this resolves
+    ``libmusart.so`` so callers like :func:`lmcache_memcpy_async` can
+    issue ``musaMemcpy`` (vendor-compatible signature with ``cudaMemcpy``).
+
+    Returns:
+        The loaded ``ctypes.CDLL`` handle, or ``None`` when no GPU runtime
+        is available (pure CPU fallback path).
+    """
     global _copy_lib
     if _copy_lib is _copy_lib_NOT_LOADED:
-        # Try to load GPU runtime libraries in priority order: CUDA first, then ROCm
-        # TODO: ROCm path to be validated on real device
-        for name, fallback in [
-            ("cudart", "libcudart.so"),  # NVIDIA CUDA Runtime
-            ("amdhip64", "libamdhip64.so"),  # AMD ROCm HIP Runtime
-        ]:
+        for name, fallback in _GPU_RUNTIME_LIBRARIES:
             try:
                 path = ctypes.util.find_library(name)
                 if path:

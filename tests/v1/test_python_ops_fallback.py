@@ -1840,7 +1840,7 @@ class TestScenarios:
 #
 # Rust raw-block backend with O_DIRECT requires page-aligned buffer
 # pointers; CUDA path gets this for free via cudaHostAlloc, and the
-# non-CUDA fallback in lmcache.non_cuda_equivalents shall mirror the same
+# non-CUDA fallback in lmcache.python_ops_fallback shall mirror the same
 # guarantee.
 
 _PINNED_ALLOC_SIZES = [1, 4095, 4096, 8192, 1024 * 1024]

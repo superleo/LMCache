@@ -25,9 +25,12 @@ from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annot
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     CuFileMemoryAllocator,
+    GPUMemoryAllocator,
     HipFileMemoryAllocator,
     MemoryFormat,
+    MemoryAllocatorInterface,
     MemoryObj,
+    MuFileMemoryAllocator,
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
@@ -43,6 +46,82 @@ _METADATA_MAX_SIZE = 4096  # reserve 4K for metadata.
 # TODO: It is possible to read this 4KB block without triggering read-ahead by
 # various means.
 _DEFAULT_THREAD_COUNT = 4
+
+# Vendor runtime library + symbol used by the POSIX fallback when
+# ``use_gds=False`` and ``gds_path`` is configured. The fallback maps a file
+# into host memory (``mmap``) and copies device <-> host with the vendor's
+# ``*Memcpy``. Keyed by the ``dst_device`` type prefix:
+#
+#   "cuda" -> libcudart.so / cudaMemcpy   (NVIDIA, default)
+#   "musa" -> libmusart.so / musaMemcpy   (Moore Threads)
+#
+# Moore Threads' MUSA runtime mirrors CUDA's API verbatim (function signatures,
+# direction enum values), so the only difference at the POSIX-fallback layer
+# is the library file and the symbol name. Adding a new device is a one-line
+# entry; reaching the fallback on an unmapped device raises a clear error.
+_POSIX_RUNTIME_SYMBOLS: dict[str, tuple[str, str]] = {
+    "cuda": ("libcudart.so", "cudaMemcpy"),
+    "musa": ("libmusart.so", "musaMemcpy"),
+}
+_GDS_SUPPORTED_DST_DEVICE_TYPES: frozenset[str] = frozenset(
+    _POSIX_RUNTIME_SYMBOLS
+)
+
+
+def _device_type_from_dst_device(dst_device: str) -> str:
+    """Return the device type prefix from a torch device string.
+
+    Args:
+        dst_device: Device string such as ``"cuda"``, ``"cuda:0"``, or
+            ``"musa:0"``.
+
+    Returns:
+        The device type prefix before any ``":"`` index separator.
+    """
+    return dst_device.split(":", 1)[0]
+
+
+def _load_posix_runtime(
+    device_type: str,
+) -> tuple[ctypes.CDLL, Callable, str]:
+    """Resolve the vendor runtime library + ``*Memcpy`` symbol for a device.
+
+    Used by :class:`GdsBackend` when the operator disables GDS (or LMCache
+    auto-disables it on tmpfs/overlayfs) but still wants ``gds_path``-style
+    storage with vendor-runtime-mediated device<->host copies.
+
+    Args:
+        device_type: Device type prefix from ``dst_device``, e.g. ``"cuda"``
+            or ``"musa"``.
+
+    Returns:
+        ``(cdll_handle, memcpy_callable, memcpy_symbol_name)``. The symbol
+        name is returned alongside the callable so the call sites in
+        :meth:`GdsBackend._load_gds` / :meth:`GdsBackend._save_gds` can
+        report a faithful error on non-zero return codes (e.g.
+        ``"musaMemcpy failed 11"`` rather than a misleading
+        ``"cudaMemcpy failed 11"`` on MUSA hosts).
+
+    Raises:
+        ValueError: If ``device_type`` has no entry in
+            :data:`_POSIX_RUNTIME_SYMBOLS`. The message names the active
+            device and lists the supported set so operators can either
+            install a vendor GDS package (and switch back to ``use_gds=True``)
+            or run on a supported device.
+    """
+    if device_type not in _POSIX_RUNTIME_SYMBOLS:
+        supported = sorted(_POSIX_RUNTIME_SYMBOLS)
+        raise ValueError(
+            f"POSIX storage fallback (use_gds=False with gds_path set) "
+            f"does not support device '{device_type}'. "
+            f"Supported devices: {supported}. Either install the vendor's "
+            f"GDS package (cufile/hipfile/mufile) and set use_gds=True, or "
+            f"run on one of the supported devices."
+        )
+    lib_name, memcpy_name = _POSIX_RUNTIME_SYMBOLS[device_type]
+    lib = ctypes.CDLL(lib_name)
+    memcpy = getattr(lib, memcpy_name)
+    return lib, memcpy, memcpy_name
 
 
 class UnsupportedMetadataVersion(Exception):
@@ -184,7 +263,7 @@ class GdsBackend(AllocatorBackendInterface):
 
     The GDS library to use is controlled by the `gds_backend` config field
     (default: ``"cufile"``). Setting ``use_gds=False`` disables the GDS API
-    and falls back to POSIX I/O via cudart.
+    and falls back to POSIX I/O via the active vendor runtime.
 
     Cache Directory Structure created by this Backend:
     /{gds_path}/{first_level}/{second_level}/{data & metadata} This structure
@@ -202,14 +281,20 @@ class GdsBackend(AllocatorBackendInterface):
         loop: asyncio.AbstractEventLoop,
         dst_device: str = "cuda",
     ):
-        assert dst_device.startswith("cuda")
+        dst_device_type = _device_type_from_dst_device(dst_device)
+        if dst_device_type not in _GDS_SUPPORTED_DST_DEVICE_TYPES:
+            raise ValueError(
+                f"GdsBackend dst_device='{dst_device}' is not supported; "
+                f"expected one of {sorted(_GDS_SUPPORTED_DST_DEVICE_TYPES)}."
+            )
         super().__init__(dst_device=dst_device)
 
         self.config = config
         self.loop = loop
         self.dst_device = dst_device
 
-        assert config.gds_path is not None, "Need to specify gds_path for GdsBackend"
+        if config.gds_path is None:
+            raise ValueError("Need to specify gds_path for GdsBackend")
 
         sharder = PathSharder(
             raw_csv=config.gds_path,
@@ -240,9 +325,6 @@ class GdsBackend(AllocatorBackendInterface):
         user_set_keys: set[str] = getattr(config, "_user_set_keys", set())
         use_gds_explicitly_set = "use_gds" in user_set_keys
 
-        # Now initialize the memory allocator
-        self.memory_allocator = self.initialize_allocator(config, metadata)
-
         self.data_suffix = _DATA_FILE_SUFFIX
         self._thread_pool = None
 
@@ -257,8 +339,14 @@ class GdsBackend(AllocatorBackendInterface):
                 self.use_gds = False
         elif self.fstype == "wekafs":
             logger.info("Weka filesystem detected, GDS usage is enforced")
-            assert self.use_gds
+            if not self.use_gds:
+                raise ValueError("Weka filesystem requires use_gds=True")
             self.data_suffix = _WEKA_DATA_FILE_SUFFIX
+
+        # Now initialize the memory allocator. For POSIX fallback we only need
+        # a regular device buffer; vendor GDS allocators can require cufile /
+        # hipfile / mufile packages even when direct GDS is disabled.
+        self.memory_allocator = self.initialize_allocator(config, metadata)
 
         # Always enable the thread pool for parallel I/O
         self.use_thread_pool = self.use_gds
@@ -273,6 +361,16 @@ class GdsBackend(AllocatorBackendInterface):
                 max_workers=thread_count, thread_name_prefix="gds-io"
             )
 
+        # Initialize all runtime-binding attributes up-front so the
+        # ``_save_gds`` / ``_load_gds`` hot path can branch on plain
+        # ``is not None`` checks regardless of which init branch ran.
+        self.gds_module = None
+        self._gds_file_cls = None
+        self._gds_driver_cls = None
+        self._posix_runtime: Optional[ctypes.CDLL] = None
+        self._posix_memcpy: Optional[Callable] = None
+        self._posix_memcpy_name: Optional[str] = None
+
         if self.use_gds:
             logger.info("Using GDS backend '%s'", self.gds_backend)
             if self.gds_backend == "cufile":
@@ -281,24 +379,45 @@ class GdsBackend(AllocatorBackendInterface):
                 # Third Party
                 import cufile
 
-                self.cudart = None
                 self.gds_module = cufile
-                self._gds_driver = self.gds_module.CuFileDriver()
             elif self.gds_backend == "hipfile":
                 # HACK: hipfile import may be buggy on some hardware
                 # (e.g., without GPUDirect), so it's temporarily put here.
                 # First Party
                 from lmcache.v1.storage_backend import hipfile_shim
 
-                self.cudart = None
                 self.gds_module = hipfile_shim
-                self._gds_driver = self.gds_module.CuFileDriver()
+            elif self.gds_backend == "mufile":
+                # HACK: mufile import is placed here to avoid import errors on
+                # hardware without the Moore Threads stack.
+                # Third Party
+                import mufile
+
+                self.gds_module = mufile
             else:
                 raise ValueError(f"Unsupported gds_backend '{self.gds_backend}'")
+            # Cache the file + driver classes once at init so the read/write
+            # hot path is vendor-agnostic. cufile/hipfile/mufile all
+            # re-export ``CuFile`` / ``CuFileDriver`` verbatim for drop-in
+            # source compatibility; if a vendor ever renames the symbol,
+            # this is the one place that needs to change.
+            self._gds_file_cls = self.gds_module.CuFile
+            self._gds_driver_cls = self.gds_module.CuFileDriver
+            self._gds_driver = self._gds_driver_cls()
         else:
-            logger.info("GDS disabled, using POSIX fallback")
-            self.gds_module = None
-            self.cudart = ctypes.CDLL("libcudart.so")
+            # POSIX fallback (mmap + vendor ``*Memcpy``). The vendor runtime
+            # is selected from ``dst_device`` so this
+            # path works on MUSA (``libmusart.so`` / ``musaMemcpy``) without
+            # the operator setting anything beyond ``use_gds=False``.
+            logger.info(
+                "GDS disabled, using POSIX fallback (device='%s')",
+                dst_device_type,
+            )
+            (
+                self._posix_runtime,
+                self._posix_memcpy,
+                self._posix_memcpy_name,
+            ) = _load_posix_runtime(dst_device_type)
 
         self.use_direct_io = False
 
@@ -799,7 +918,6 @@ class GdsBackend(AllocatorBackendInterface):
             return None
         if self._debug_asserts:
             assert memory_obj.tensor is not None
-            assert memory_obj.tensor.is_cuda
             assert torch.device(self.dst_device) == torch.device(
                 memory_obj.tensor.device
             )
@@ -831,7 +949,6 @@ class GdsBackend(AllocatorBackendInterface):
             tensor = memory_obj.tensor
             assert tensor is not None
             if self._debug_asserts:
-                assert tensor.is_cuda
                 assert torch.device(self.dst_device) == torch.device(tensor.device)
             addr = ctypes.c_void_p(tensor.data_ptr())
             dev_offset = 0
@@ -955,14 +1072,14 @@ class GdsBackend(AllocatorBackendInterface):
         try:
             with open(tmp_path, "wb") as f:
                 f.write(metadata)
-            if self.gds_module:
-                with self.gds_module.CuFile(
+            if self._gds_file_cls is not None:
+                with self._gds_file_cls(
                     tmp_path, "r+", use_direct_io=self.use_direct_io
                 ) as f:
                     f.write(
                         addr, kv_chunk.nbytes, file_offset=offset, dev_offset=dev_offset
                     )
-            elif self.cudart:
+            elif self._posix_memcpy is not None:
                 # mmap the file
                 fd = os.open(tmp_path, os.O_RDWR)
                 nbytes = kv_chunk.nbytes
@@ -977,14 +1094,17 @@ class GdsBackend(AllocatorBackendInterface):
                 buf_addr = arr.__array_interface__["data"][0]
 
                 assert addr.value is not None
-                res = self.cudart.cudaMemcpy(
+                # Direction 2 = DeviceToHost (cudaMemcpyDeviceToHost). MUSA
+                # mirrors CUDA's enum verbatim, so the same int works for
+                # libmusart's ``musaMemcpy``.
+                res = self._posix_memcpy(
                     ctypes.c_void_p(buf_addr + offset),
-                    ctypes.c_void_p(int(addr.value) + device_offset),
+                    ctypes.c_void_p(int(addr.value) + dev_offset),
                     ctypes.c_size_t(nbytes),
                     ctypes.c_int(2),
                 )
                 if res:
-                    raise RuntimeError(f"cudaMemcpy failed {res}")
+                    raise RuntimeError(f"{self._posix_memcpy_name} failed {res}")
                 del arr
                 mm.close()
 
@@ -1004,8 +1124,8 @@ class GdsBackend(AllocatorBackendInterface):
     ) -> int:
         """Read data from disk into a GPU buffer"""
         try:
-            if self.gds_module:
-                with self.gds_module.CuFile(
+            if self._gds_file_cls is not None:
+                with self._gds_file_cls(
                     gds_path, "r", use_direct_io=self.use_direct_io
                 ) as f:
                     return f.read(
@@ -1014,7 +1134,7 @@ class GdsBackend(AllocatorBackendInterface):
                         file_offset=file_offset,
                         dev_offset=dev_offset,
                     )
-            elif self.cudart:
+            elif self._posix_memcpy is not None:
                 fd = os.open(gds_path, os.O_RDONLY)
                 file_size = os.fstat(fd).st_size
 
@@ -1040,7 +1160,9 @@ class GdsBackend(AllocatorBackendInterface):
                 addr = arr.__array_interface__["data"][0]
 
                 assert gpu_pointer.value is not None
-                res = self.cudart.cudaMemcpy(
+                # Direction 1 = HostToDevice (cudaMemcpyHostToDevice); same
+                # enum value on MUSA.
+                res = self._posix_memcpy(
                     ctypes.c_void_p(int(gpu_pointer.value) + dev_offset),
                     ctypes.c_void_p(addr + file_offset),
                     ctypes.c_size_t(size_in_bytes),
@@ -1048,13 +1170,16 @@ class GdsBackend(AllocatorBackendInterface):
                 )
 
                 if res != 0:
-                    raise RuntimeError(f"cudaMemcpy failed with code {res}")
+                    raise RuntimeError(
+                        f"{self._posix_memcpy_name} failed with code {res}"
+                    )
                 del arr
                 mm.close()
                 return size_in_bytes
             else:
                 raise RuntimeError(
-                    "Both gds_module and cudart are None, this should not happen"
+                    "Both GDS file class and POSIX memcpy are unset; "
+                    "GdsBackend.__init__ did not complete properly."
                 )
         except Exception as e:
             # return -1 on any exception, and log the error.
@@ -1078,14 +1203,52 @@ class GdsBackend(AllocatorBackendInterface):
 
     def initialize_allocator(
         self, config: LMCacheEngineConfig, metadata: LMCacheMetadata
-    ) -> Union[CuFileMemoryAllocator, HipFileMemoryAllocator]:
-        assert config.gds_buffer_size is not None
-        allocator_cls = (
-            HipFileMemoryAllocator
-            if self.gds_backend == "hipfile"
-            else CuFileMemoryAllocator
-        )
-        return allocator_cls(config.gds_buffer_size * 1024**2)
+    ) -> MemoryAllocatorInterface:
+        """Instantiate the GDS allocator matching ``config.gds_backend``.
+
+        Args:
+            config: LMCache engine configuration. ``config.gds_buffer_size``
+                must be set (in MiB).
+            metadata: LMCache engine metadata (unused today; reserved for
+                device-id selection in a future refactor).
+
+        Returns:
+            A memory allocator appropriate for the active storage mode. Direct
+            GDS uses ``CuFileMemoryAllocator`` for ``"cufile"``,
+            ``HipFileMemoryAllocator`` for ``"hipfile"``, or
+            ``MuFileMemoryAllocator`` for ``"mufile"``. POSIX fallback
+            (``use_gds=False``) uses a plain ``GPUMemoryAllocator`` because
+            it copies with the vendor runtime and does not need GDS buffer
+            registration.
+
+        Raises:
+            ValueError: If ``config.gds_buffer_size`` is not set.
+            ValueError: If ``self.gds_backend`` is not one of the three
+                supported names.
+        """
+        if config.gds_buffer_size is None:
+            raise ValueError("Need to specify gds_buffer_size for GdsBackend")
+
+        size_bytes = config.gds_buffer_size * 1024**2
+        if not getattr(self, "use_gds", True):
+            return GPUMemoryAllocator(
+                size_bytes,
+                device=self.dst_device,
+                align_bytes=4096,
+            )
+
+        allocator_classes: dict[str, type] = {
+            "cufile": CuFileMemoryAllocator,
+            "hipfile": HipFileMemoryAllocator,
+            "mufile": MuFileMemoryAllocator,
+        }
+        allocator_cls = allocator_classes.get(self.gds_backend)
+        if allocator_cls is None:
+            raise ValueError(
+                f"Unsupported gds_backend '{self.gds_backend}'; "
+                f"expected one of {sorted(allocator_classes)}."
+            )
+        return allocator_cls(size_bytes)
 
     def allocate(
         self,

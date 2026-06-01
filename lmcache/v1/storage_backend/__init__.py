@@ -24,15 +24,20 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def is_cuda_worker(metadata: LMCacheMetadata) -> bool:
-    """
-    Check if the current role is worker and a GPU accelerator is available.
+def is_gpu_worker(metadata: LMCacheMetadata) -> bool:
+    """Whether the current role is worker and any GPU accelerator is available.
+
+    Despite the historical name ``is_cuda_worker``, this predicate has always
+    been device-agnostic: it returns True for CUDA, MUSA, XPU, HPU, etc.
+    The name was renamed to match the "first-class device type" framing of
+    the MUSA support design.
 
     Args:
         metadata: The LMCache engine metadata.
 
     Returns:
-        True if the worker is not a scheduler and a GPU accelerator is available.
+        True if the worker is not a scheduler and a GPU accelerator is
+        available on this process.
     """
     return metadata.role != "scheduler" and torch_dev.is_available()
 
@@ -108,6 +113,73 @@ def storage_plugin_launcher(
             logger.error(f"Failed to create backend {storage_plugin}: {str(e)}")
 
 
+# Maps every supported ``gds_backend`` name to the ``torch_device_type`` it
+# requires. ROCm masquerades as ``"cuda"`` in PyTorch, so ``hipfile`` is also
+# keyed by ``"cuda"``. Keep this in sync with
+# ``GdsBackend.initialize_allocator``.
+_GDS_BACKEND_REQUIRED_DEVICE: dict[str, str] = {
+    "cufile": "cuda",
+    "hipfile": "cuda",
+    "mufile": "musa",
+}
+
+
+def _validate_cuda_only_storage_features(config: LMCacheEngineConfig) -> None:
+    """Reject ``gds_path`` configurations that can't run on the active device.
+
+    GDS support depends on a vendor-specific allocator and runtime. LMCache
+    ships ``CuFileMemoryAllocator`` (NVIDIA ``cufile``),
+    ``HipFileMemoryAllocator`` (AMD ``hipfile``, runs on PyTorch+ROCm where
+    ``torch_device_type == "cuda"``), and ``MuFileMemoryAllocator`` (Moore
+    Threads ``mufile``, requires ``torch_device_type == "musa"``). Any other
+    accelerator currently has no GDS allocator wired.
+
+    Mismatched combinations (e.g. MUSA + ``gds_backend='cufile'`` or CUDA +
+    ``gds_backend='mufile'``) would crash deep inside the allocator
+    constructor; fail fast here with a message that points at the correct
+    backend for the active device.
+
+    Args:
+        config: The LMCache engine configuration.
+
+    Raises:
+        ValueError: If ``config.gds_path`` is set on a device/backend
+            combination that LMCache does not support.
+    """
+    if config.gds_path is None:
+        return
+
+    backend = config.gds_backend or "cufile"
+    required = _GDS_BACKEND_REQUIRED_DEVICE.get(backend)
+    if required is None:
+        # Unknown backend name — let ``GdsBackend.__init__`` raise its own
+        # "Unsupported gds_backend" error with the full list.
+        return
+
+    if torch_device_type == required:
+        return
+
+    if torch_device_type == "musa":
+        raise ValueError(
+            f"config.gds_path on MUSA requires gds_backend='mufile' (NVIDIA "
+            f"cufile and AMD hipfile only run when torch_device_type == "
+            f"'cuda'); got gds_backend='{backend}'. Set gds_backend='mufile' "
+            "in your config."
+        )
+    if backend == "mufile":
+        raise ValueError(
+            f"config.gds_backend='mufile' requires MUSA (Moore Threads) but "
+            f"torch_device_type is '{torch_device_type}'. Use "
+            "gds_backend='cufile' (NVIDIA) or 'hipfile' (AMD) on CUDA-built "
+            "PyTorch."
+        )
+    raise ValueError(
+        f"config.gds_path is not supported on '{torch_device_type}' "
+        "(no GDS allocator wired for this device). Unset gds_path or run on "
+        f"a device whose backend is in {sorted(_GDS_BACKEND_REQUIRED_DEVICE)}."
+    )
+
+
 def CreateStorageBackends(
     config: LMCacheEngineConfig,
     metadata: LMCacheMetadata,
@@ -117,7 +189,8 @@ def CreateStorageBackends(
     skip_backends: Optional[AbstractSet[str]] = None,
     existing_backends: Optional[OrderedDict[str, StorageBackendInterface]] = None,
 ) -> OrderedDict[str, StorageBackendInterface]:
-    if is_cuda_worker(metadata):
+    _validate_cuda_only_storage_features(config)
+    if is_gpu_worker(metadata):
         dst_device = f"{torch_device_type}:{torch_dev.current_device()}"
     else:
         dst_device = "cpu"
