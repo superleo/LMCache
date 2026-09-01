@@ -15,26 +15,34 @@ import triton
 import triton.language as tl
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 
-_FP8_E4B15: dict[int, int] = {}
+_FP8_E4B15: dict[tuple[str, int], int] = {}
 
 
 def _use_fp8_e4b15(device: int = 0) -> int:
-    """Return 1 if tuple capability is < (8, 9), else 0.
+    """Return whether the active device uses the E4M3B15 key format.
 
     Triton supports ``float8e4nv`` on CUDA SM89+ (Hopper and newer). For
     older CUDA architectures we use ``float8e4b15`` as a compatibility
-    fallback.
+    fallback. MUSA capability tuples are not CUDA SM versions; MUSA uses the
+    portable E4M3B15 path independently of its reported capability.
     """
-    if device not in _FP8_E4B15:
-        cap = torch_dev.get_device_capability(device)
-        # CUDA/MUSA may return (major, minor) tuples; XPU returns a dict,
-        # which falls back to e4nv (0).
-        # To be verified: capability shape/semantics may depend on real devices
-        # on different backends.
-        _FP8_E4B15[device] = 1 if isinstance(cap, tuple) and cap < (8, 9) else 0
-    return _FP8_E4B15[device]
+    cache_key = (torch_device_type, device)
+    if cache_key not in _FP8_E4B15:
+        if torch_device_type == "musa":
+            _FP8_E4B15[cache_key] = 1
+        elif torch_device_type == "cuda":
+            cap = torch_dev.get_device_capability(device)
+            _FP8_E4B15[cache_key] = 1 if isinstance(cap, tuple) and cap < (8, 9) else 0
+        else:
+            _FP8_E4B15[cache_key] = 0
+    return _FP8_E4B15[cache_key]
+
+
+def _use_software_fp8(device_type: str | None = None) -> int:
+    """Return whether FP8 conversion must bypass Triton custom lowering."""
+    return int((device_type or torch_device_type) == "musa")
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +79,7 @@ def _tq_full_dequant_kv(
     BLOCK_D: tl.constexpr,
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    SOFTWARE_FP8: tl.constexpr = 0,
 ):
     """Full dequant: reconstruct K (MSE centroids * norm or FP8) and V to fp16."""
     pos = tl.program_id(0)
@@ -94,7 +103,26 @@ def _tq_full_dequant_kv(
     ko_base = bid * stride_ko_b + hid * stride_ko_h + pos * stride_ko_s
     if KEY_FP8:
         k_raw = tl.load(KV_cache_ptr + slot_base + d_offs, mask=d_mask, other=0)
-        if FP8_E4B15:
+        if SOFTWARE_FP8:
+            # E4M3B15 decode expressed with primitive arithmetic. This is
+            # equivalent to the CUDA inline-assembly conversion and avoids
+            # requiring MUSA Triton to lower a custom float8 type.
+            raw_i = k_raw.to(tl.int32)
+            sign = (raw_i >> 7) & 1
+            exponent = (raw_i >> 3) & 0xF
+            mantissa = raw_i & 0x7
+            exponent_f = exponent.to(tl.float32)
+            mantissa_f = mantissa.to(tl.float32)
+            normal = (1.0 + mantissa_f / 8.0) * tl.exp2(exponent_f - 15.0)
+            subnormal = mantissa_f * (2.0**-17)
+            k_recon = tl.where(exponent == 0, subnormal, normal)
+            k_recon = tl.where(
+                exponent == 15,
+                tl.minimum(k_recon, 1.75),
+                k_recon,
+            )
+            k_recon = tl.where(sign != 0, -k_recon, k_recon)
+        elif FP8_E4B15:
             k_recon = k_raw.to(tl.float8e4b15, bitcast=True).to(tl.float32)
         else:
             k_recon = k_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)

@@ -40,6 +40,10 @@ from lmcache.v1.distributed.serde.turboquant import (
     TurboQuantSerdeConfig,
     TurboQuantSerializer,
 )
+from lmcache.v1.distributed.serde.turboquant.fp8 import (
+    decode_fp8_e4b15,
+    encode_fp8_e4b15,
+)
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.platform import current_device_spec
@@ -122,6 +126,64 @@ def test_turboquant_config_rejects_invalid_preset() -> None:
 
     with pytest.raises(ValueError, match="Unsupported TurboQuant preset"):
         _ = cfg.key_quant_bits
+
+
+def test_turboquant_e4b15_codec_matches_cuda_layout() -> None:
+    """Portable E4M3B15 bytes match CUDA's scaled E4M3FN representation."""
+    values = torch.tensor(
+        [-1.75, -1.0, -0.5, -(2.0**-14), 0.0, 2.0**-14, 0.5, 1.0, 1.75],
+        dtype=torch.float32,
+    )
+    # These bytes are the E4M3FN encodings of fp16(values * 2**8), which is
+    # the CUDA Triton E4M3B15 conversion contract.
+    expected_bytes = torch.tensor(
+        [0xFE, 0xF8, 0xF0, 0x88, 0x00, 0x08, 0x70, 0x78, 0x7E],
+        dtype=torch.uint8,
+    )
+    expected_values = torch.tensor(
+        [-1.75, -1.0, -0.5, -(2.0**-14), 0.0, 2.0**-14, 0.5, 1.0, 1.75],
+        dtype=torch.float32,
+    )
+
+    encoded = encode_fp8_e4b15(values)
+    assert torch.equal(encoded, expected_bytes)
+    assert torch.allclose(decode_fp8_e4b15(encoded), expected_values, atol=0, rtol=0)
+
+
+def test_turboquant_e4b15_codec_preserves_cuda_fp32_rtz() -> None:
+    """FP32 input uses Triton's FP16 RTZ intermediate rounding."""
+    values = torch.tensor([-1.68748, 1.68748], dtype=torch.float32)
+
+    encoded = encode_fp8_e4b15(values)
+
+    assert torch.equal(encoded, torch.tensor([0xFD, 0x7D], dtype=torch.uint8))
+
+
+def test_turboquant_fp8_policy_is_backend_aware(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MUSA does not infer FP8 format from CUDA SM capability tuples."""
+    pytest.importorskip("triton")
+
+    # First Party
+    from lmcache.v1.distributed.serde.turboquant import decode_kernel
+
+    decode_kernel._FP8_E4B15.clear()
+    monkeypatch.setattr(
+        "lmcache.v1.distributed.serde.turboquant.decode_kernel.torch_device_type",
+        "musa",
+    )
+    assert decode_kernel._use_fp8_e4b15(0) == 1
+    assert decode_kernel._use_software_fp8() == 1
+
+    decode_kernel._FP8_E4B15.clear()
+    monkeypatch.setattr(
+        "lmcache.v1.distributed.serde.turboquant.decode_kernel.torch_device_type",
+        "cuda",
+    )
+    monkeypatch.setattr(torch_dev, "get_device_capability", lambda _: (9, 0))
+    assert decode_kernel._use_fp8_e4b15(0) == 0
+    assert decode_kernel._use_software_fp8() == 0
 
 
 def test_estimate_serialized_size_k8v4() -> None:

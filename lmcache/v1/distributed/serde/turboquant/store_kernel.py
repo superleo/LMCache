@@ -169,6 +169,7 @@ def _tq_fused_store_fp8(
     BLOCK_VAL: tl.constexpr,
     BLOCK_GRP: tl.constexpr = 16,
     FP8_E4B15: tl.constexpr = 0,  # 1 = e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    KEY_BYTES: tl.constexpr = 0,
 ):
     """FP8 key cast+scatter + value uniform quantization."""
     pid = tl.program_id(0)
@@ -189,9 +190,15 @@ def _tq_fused_store_fp8(
     # ── FP8 KEY: cast to FP8 in-kernel and store ─────────────────
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
-    k_vals = tl.load(Key_ptr + base + d_offs, mask=d_mask, other=0.0)
-    k_fp8 = k_vals.to(tl.float8e4b15) if FP8_E4B15 else k_vals.to(tl.float8e4nv)
-    k_bytes = k_fp8.to(tl.uint8, bitcast=True)
+    if KEY_BYTES:
+        # MUSA Triton currently exposes fp8e4b15 but has no custom type
+        # conversion hook.  The launcher supplies already encoded bytes for
+        # this path, avoiding a backend-specific ``.to(float8)`` conversion.
+        k_bytes = tl.load(Key_ptr + base + d_offs, mask=d_mask, other=0).to(tl.uint8)
+    else:
+        k_vals = tl.load(Key_ptr + base + d_offs, mask=d_mask, other=0.0)
+        k_fp8 = k_vals.to(tl.float8e4b15) if FP8_E4B15 else k_vals.to(tl.float8e4nv)
+        k_bytes = k_fp8.to(tl.uint8, bitcast=True)
     tl.store(KV_cache_ptr + slot_base + d_offs, k_bytes, mask=d_mask)
 
     # ── VALUE QUANTIZE + PACK ───────────────────────────────────────
@@ -382,6 +389,17 @@ def triton_turboquant_store(
         v_flat = value.reshape(NH, D).contiguous()
 
         fp8_e4b15 = _use_fp8_e4b15(key.device.index or 0)
+        musa_software_fp8 = key.device.type == "musa"
+        if musa_software_fp8:
+            # MUSA's Triton backend does not lower float8 conversions yet.
+            # Encode on the active device using portable PyTorch arithmetic;
+            # the resulting bytes use the same E4M3B15 layout as CUDA.
+            # First Party
+            from lmcache.v1.distributed.serde.turboquant.fp8 import (
+                encode_fp8_e4b15,
+            )
+
+            k_flat = encode_fp8_e4b15(k_flat)
 
         grid = (NH,)
         _tq_fused_store_fp8[grid](
@@ -402,6 +420,7 @@ def triton_turboquant_store(
             BLOCK_VAL=BLOCK_VAL,
             BLOCK_GRP=block_grp,
             FP8_E4B15=fp8_e4b15,
+            KEY_BYTES=1 if musa_software_fp8 else 0,
             num_warps=4,
             num_stages=1,
         )
