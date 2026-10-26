@@ -66,6 +66,30 @@ def test_vllm_mla():
     assert fmt == F.NL_X_NB_BS_HS
 
 
+def test_vllm_blocked_scale_mla_variant() -> None:
+    width = 132
+    kv = [torch.zeros(NB, BS, width, dtype=torch.uint8) for _ in range(NL)]
+
+    fmt, out = detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD"})
+
+    assert fmt == F.NL_X_NB_BSV_BSS
+    assert isinstance(out, list)
+    assert isinstance(out[0], torch.Tensor)
+    assert out[0].shape[-1] == width
+
+
+def test_vllm_dsv41_width_is_not_common_blocked_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the MUSA-only 584B geometry out of other backend detection."""
+    monkeypatch.setattr(_VLLM_DEV, "cuda")
+    kv = [torch.zeros(NB, BS, 584, dtype=torch.uint8) for _ in range(NL)]
+
+    fmt, _ = detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD"})
+
+    assert fmt == F.NL_X_NB_BS_HS
+
+
 @pytest.mark.parametrize("hint", [{}, {"kv_layout": "NHD"}, {"kv_layout": "HND"}])
 def test_vllm_rbln_native_singleton_axis(monkeypatch, hint):
     # vLLM-RBLN's 6-D HND layout is its own format, so it is detected from the

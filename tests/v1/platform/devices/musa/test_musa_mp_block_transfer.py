@@ -200,16 +200,22 @@ def test_musa_block_transfer_fallback_mla_d2h_and_h2d() -> None:
         assert torch.count_nonzero(target[layer_idx][3]) == 0
 
 
-def test_musa_block_transfer_fallback_blocked_scale_d2h_and_h2d() -> None:
+@pytest.mark.parametrize(
+    ("row_bytes", "value_bytes", "scale_bytes"),
+    [(132, 128, 4), (584, 576, 8)],
+)
+def test_musa_block_transfer_fallback_blocked_scale_d2h_and_h2d(
+    row_bytes: int, value_bytes: int, scale_bytes: int
+) -> None:
     """The MUSA adapter repacks blocked-scale bytes through its CPU fallback."""
-    source = [torch.arange(2 * 132, dtype=torch.uint8).view(1, 2, 132)]
-    chunk = torch.empty(1, 2, 132, dtype=torch.uint8)
+    source = [torch.arange(2 * row_bytes, dtype=torch.uint8).view(1, 2, row_bytes)]
+    chunk = torch.empty(1, 2, row_bytes, dtype=torch.uint8)
     shape_desc = _shape_desc(
         num_layers=1,
         num_blocks=1,
         block_size=2,
         num_heads=1,
-        head_size=132,
+        head_size=row_bytes,
         kv_size=1,
         dtype=torch.uint8,
     )
@@ -225,8 +231,14 @@ def test_musa_block_transfer_fallback_blocked_scale_d2h_and_h2d() -> None:
     )
 
     raw = source[0].view(-1)
-    assert torch.equal(chunk[0, :, :128], raw[:256].view(2, 128))
-    assert torch.equal(chunk[0, :, 128:], raw[256:].view(2, 4))
+    assert torch.equal(
+        chunk[0, :, :value_bytes],
+        raw[: 2 * value_bytes].view(2, value_bytes),
+    )
+    assert torch.equal(
+        chunk[0, :, value_bytes:],
+        raw[2 * value_bytes :].view(2, scale_bytes),
+    )
     assert torch.equal(target[0], source[0])
 
 

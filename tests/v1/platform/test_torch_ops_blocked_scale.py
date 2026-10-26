@@ -2,10 +2,10 @@
 """NL_X_NB_BSV_BSS through the torch fallback block transfer.
 
 A blocked-scale page stores, per block, all tokens' values and then all
-tokens' 4-byte scales, while LMCache chunk rows are token-major
-``[vals | scale]``. The torch fallback must repack between the two exactly as
-the CUDA kernels do (``tests/v1/multiprocess/test_blocked_scale_format.py``),
-rather than copying the page bytes as if they were token-major.
+tokens' scales, while LMCache chunk rows are token-major ``[vals | scale]``.
+The torch fallback must repack between the two exactly as the CUDA kernels do
+(``tests/v1/multiprocess/test_blocked_scale_format.py``), rather than copying
+the page bytes as if they were token-major.
 """
 
 # Third Party
@@ -23,14 +23,18 @@ _NB = 6
 _NL = 2
 
 
-def _blocked_write(page: torch.Tensor, slot: int, row: torch.Tensor) -> None:
+def _blocked_write(
+    page: torch.Tensor, slot: int, row: torch.Tensor, scale_bytes: int
+) -> None:
     """Write one token's row into the blocked page layout (the ground truth)."""
     block, offset = divmod(slot, _BS)
     flat = page[block].view(-1)
-    vals = row.numel() - 4
+    vals = row.numel() - scale_bytes
     flat[offset * vals : (offset + 1) * vals] = row[:vals]
     scale_base = _BS * vals
-    flat[scale_base + offset * 4 : scale_base + (offset + 1) * 4] = row[vals:]
+    flat[
+        scale_base + offset * scale_bytes : scale_base + (offset + 1) * scale_bytes
+    ] = row[vals:]
 
 
 def _pages(
@@ -85,11 +89,18 @@ def _block_transfer(
     )
 
 
-@pytest.mark.parametrize("row", [12, 132])
+@pytest.mark.parametrize(
+    ("row", "scale_bytes"),
+    [(132, 4), (584, 8)],
+)
 @pytest.mark.parametrize(("padding", "offset"), [(0, 0), (16, 7)])
 @pytest.mark.parametrize("skip", [0, 1, 2])
 def test_block_transfer_gathers_token_major_rows(
-    row: int, padding: int, offset: int, skip: int
+    row: int,
+    scale_bytes: int,
+    padding: int,
+    offset: int,
+    skip: int,
 ) -> None:
     """D2H chunk rows are canonical; H2D writes them back to blocked slots."""
     block_ids = [4, 1, 3]
@@ -98,7 +109,7 @@ def test_block_transfer_gathers_token_major_rows(
     src, _ = _pages(row, padding, offset)
     for layer in range(_NL):
         for i, slot in enumerate(slots):
-            _blocked_write(src[layer], slot, rows[layer, i])
+            _blocked_write(src[layer], slot, rows[layer, i], scale_bytes)
 
     chunks = [torch.full((_NL, 2 * _BS, row), 165, dtype=torch.uint8) for _ in range(2)]
     _block_transfer(src, chunks, block_ids, TransferDirection.D2H, skip)

@@ -58,7 +58,10 @@ class _MusaTensor(torch.Tensor):
         return cast(torch.device, SimpleNamespace(type="musa", index=0))
 
 
-@pytest.mark.parametrize(("blocked", "width"), [(False, 16), (True, 12), (True, 132)])
+@pytest.mark.parametrize(
+    ("blocked", "width", "value_bytes", "scale_bytes"),
+    [(False, 16, 0, 0), (True, 132, 128, 4), (True, 584, 576, 8)],
+)
 @pytest.mark.parametrize(("direction", "skip"), [(0, 0), (0, 1), (0, 2), (1, 0)])
 @pytest.mark.parametrize(
     "result",
@@ -69,6 +72,8 @@ def test_strided_native_block_transfer_contract(
     monkeypatch: pytest.MonkeyPatch,
     blocked: bool,
     width: int,
+    value_bytes: int,
+    scale_bytes: int,
     direction: int,
     skip: int,
     result: str,
@@ -169,8 +174,8 @@ def test_strided_native_block_transfer_contract(
             width * elem,
             stride * elem,
             int(blocked),
-            width - 4 if blocked else 0,
-            4 if blocked else 0,
+            value_bytes,
+            scale_bytes,
         )
 
 

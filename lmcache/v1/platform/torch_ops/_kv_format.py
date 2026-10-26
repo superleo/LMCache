@@ -8,16 +8,15 @@ import torch
 
 # First Party
 from lmcache.lmcache_native import EngineKVFormat
+from lmcache.v1.gpu_connector.kv_format.blocked_scale import (
+    resolve_blocked_scale_geometry,
+)
 
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.gpu_connector.kv_format.specs.base import KVFormatSpec
 
 __all__ = ["_blocked_scale_views", "_format_spec"]
-
-# Each token's scale in a blocked-scale page is one fp32 (vllm
-# ``indexer_k_quant_and_cache``); the rest of the row is its fp8 values.
-_BLOCKED_SCALE_BYTES = 4
 
 
 def _blocked_scale_views(
@@ -36,12 +35,21 @@ def _blocked_scale_views(
             elements must be contiguous.
 
     Returns:
-        ``(vals, scales)`` views aliasing ``blocks``, shaped
-        ``[NB, BS, row - scale_units]`` and ``[NB, BS, scale_units]``.
+        ``(vals, scales)`` views aliasing ``blocks``.
+
+    Raises:
+        ValueError: If the page row is not a supported blocked-scale geometry.
     """
     num_blocks, block_size, row = blocks.shape
-    scale_units = _BLOCKED_SCALE_BYTES // blocks.element_size()
-    val_units = row - scale_units
+    value_bytes, scale_bytes = resolve_blocked_scale_geometry(
+        row * blocks.element_size()
+    )
+    if value_bytes % blocks.element_size() or scale_bytes % blocks.element_size():
+        raise ValueError(
+            "blocked-scale widths must be divisible by the tensor element size"
+        )
+    scale_units = scale_bytes // blocks.element_size()
+    val_units = value_bytes // blocks.element_size()
     # ``view`` rather than ``flatten``: a copy would silently drop the writes.
     flat = blocks.view(num_blocks, block_size * row)
     vals = flat[:, : block_size * val_units].unflatten(1, (block_size, val_units))
