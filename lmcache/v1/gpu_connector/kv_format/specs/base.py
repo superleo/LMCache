@@ -22,6 +22,9 @@ from typing import ClassVar
 import torch
 
 # First Party
+from lmcache.v1.gpu_connector.kv_format.blocked_scale import (
+    resolve_blocked_scale_geometry,
+)
 from lmcache.v1.gpu_connector.kv_format.types import DiscoverableKVCache
 import lmcache.lmcache_native as lmcache_native
 
@@ -274,6 +277,26 @@ class KVFormatSpec(ABC):
         if kv_size == 1:
             return (num_layers, num_slots, hidden_dim)
         return (kv_size, num_layers, num_slots, hidden_dim)
+
+    @classmethod
+    def blocked_scale_geometry(cls, row_bytes: int) -> tuple[int, int]:
+        """Resolve the physical widths of a blocked-scale row.
+
+        Args:
+            row_bytes: Logical token-row width in bytes.
+
+        Returns:
+            A ``(value_bytes, scale_bytes)`` pair.
+
+        Raises:
+            ValueError: If this spec is not blocked-scale or the row width is
+                unsupported.
+        """
+        if not cls.requires_blocked_scale_repacking:
+            raise ValueError(
+                f"{cls.engine_kv_format!r} does not use blocked-scale storage"
+            )
+        return resolve_blocked_scale_geometry(row_bytes)
 
     def __init__(self, kv_caches: DiscoverableKVCache) -> None:
         # Borrowed, not owned: see the class docstring's "Lifetime" note. The

@@ -8,9 +8,6 @@ import torch
 
 # First Party
 from lmcache.lmcache_native import EngineKVFormat
-from lmcache.v1.gpu_connector.kv_format.blocked_scale import (
-    resolve_blocked_scale_geometry,
-)
 
 if TYPE_CHECKING:
     # First Party
@@ -21,6 +18,7 @@ __all__ = ["_blocked_scale_views", "_format_spec"]
 
 def _blocked_scale_views(
     blocks: torch.Tensor,
+    format_spec: "type[KVFormatSpec]",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Split a blocked-scale page into token-indexed value and scale views.
 
@@ -41,7 +39,7 @@ def _blocked_scale_views(
         ValueError: If the page row is not a supported blocked-scale geometry.
     """
     num_blocks, block_size, row = blocks.shape
-    value_bytes, scale_bytes = resolve_blocked_scale_geometry(
+    value_bytes, scale_bytes = format_spec.blocked_scale_geometry(
         row * blocks.element_size()
     )
     if value_bytes % blocks.element_size() or scale_bytes % blocks.element_size():
