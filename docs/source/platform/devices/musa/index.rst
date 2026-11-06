@@ -200,6 +200,50 @@ Look for LMCache logs like:
    LMCache hit tokens: ...
    Retrieved ... required tokens
 
+GLM-5.3 and GLM-5.3-Flash MP Layouts
+----------------------------------------
+
+The MUSA LMCache-driven MP path can transfer the existing blocked-scale
+indexer format (``NL_X_NB_BSV_BSS``) and NHD/HND single-plane packed formats
+(``NL_X_NB_BS_NH_CS`` / ``NL_X_NB_NH_BS_CS``) through the torch fallback.
+Page padding and per-group block strides are preserved. These layouts do
+not require ``musa-aiter`` and are not dispatched to its contiguous MLA ABI,
+even when native transfer is enabled.
+
+For GLM-5.3-Flash, use ``LMCacheMPConnector``, prefix caching, and separate
+object groups, not the in-process connector example above:
+
+.. code-block:: bash
+
+   export LMCACHE_MUSA_HANDLE_TRANSFER=1
+   export LMCACHE_MP_TRANSFER_MODE=lmcache_driven
+   export LMCACHE_MUSA_NATIVE_KV_TRANSFER=0
+   lmcache server --separate-object-groups --l1-size-gb 100
+
+In the vLLM process, with the same transfer environment:
+
+.. code-block:: bash
+
+   vllm serve /path/to/GLM-5.3-Flash \
+     --tensor-parallel-size 4 \
+     --enable-prefix-caching \
+     --kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both"}'
+
+The engine must provide native support for the model and the required MUSA
+memory/event IPC APIs. Inspect the resolved per-group tokens/slots and block
+strides after startup; do not hardcode the CUDA recipe's TP4 geometry.
+The kpool-tail scratch group is excluded by the vLLM adapter, not copied as
+ordinary KV. See :doc:`/recipes/glm5_3` and
+:doc:`/recipes/glm5_3_flash` for model-specific constraints.
+
+.. note::
+
+   These are transfer-layout capabilities, not MUSA model-validation results.
+   The recipes' model validation was performed on CUDA. Real MUSA engine
+   group capture and cold-store/warm-retrieve validation remain required.
+   Legacy Mamba tuple/rank-5 pages, MTP, and arbitrary partial-prefix
+   disaggregation are outside this layout extension.
+
 Troubleshooting
 ---------------
 
