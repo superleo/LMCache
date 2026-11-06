@@ -276,7 +276,7 @@ fi
 log "Running focused MUSA connector and transfer tests"
 run_pytest "${PYTEST_ARGS[@]}" \
     tests/v1/test_musa_support.py \
-    tests/v1/test_musa_native.py \
+    tests/v1/platform/devices/musa/test_musa_native.py \
     tests/v1/platform/devices/musa/test_musa_pin_memory.py \
     tests/v1/platform/devices/musa/test_musa_staging_copy.py \
     tests/v1/platform/devices/musa/test_musa_mp_block_transfer.py::test_musa_block_transfer_device_non_mla_d2h_and_h2d \
