@@ -160,6 +160,35 @@ def _infer_dtype(
         ) from exc
 
 
+def _paged_shape_and_stride(
+    format_spec: "type[KVFormatSpec]",
+    shape_desc: PageBufferShapeDesc,
+) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+    """Return a page shape with dense inner axes and its actual block stride.
+
+    Args:
+        format_spec: Resolved spec for a supported MUSA pointer layout.
+        shape_desc: Group-local page dimensions and block stride in elements.
+
+    Returns:
+        The pointer leaf shape and explicit strides for dim-0 padded layouts,
+        or ``None`` strides for layouts requiring contiguous storage.
+    """
+    nb = int(shape_desc.nb)
+    bs = int(shape_desc.bs)
+    nh = int(shape_desc.nh)
+    hs = int(shape_desc.hs)
+    shape = format_spec.paged_pointer_shape(nb, bs, nh, hs)
+    if format_spec.supports_dim0_padding:
+        strides = [1] * len(shape)
+        for axis in range(len(shape) - 2, -1, -1):
+            strides[axis] = strides[axis + 1] * shape[axis + 1]
+        block_stride = int(getattr(shape_desc, "block_stride_elems", 0))
+        strides[0] = block_stride or strides[0]
+        return shape, tuple(strides)
+    return shape, None
+
+
 def _validate_pointer_tensor(value: torch.Tensor, expected_layers: int) -> None:
     """Validate a packed per-layer pointer tensor."""
     if value.ndim != 1 or value.dtype not in (torch.int64, torch.uint64):
@@ -215,13 +244,7 @@ def _reconstruct_paged_layers(
         raise ValueError(
             f"MUSA pointer reconstruction requires a MUSA device, got {device}"
         )
-    nb = int(shape_desc.nb)
-    bs = int(shape_desc.bs)
-    nh = int(shape_desc.nh)
-    hs = int(shape_desc.hs)
-    shape = format_spec.paged_pointer_shape(nb, bs, nh, hs)
-    block_stride = int(getattr(shape_desc, "block_stride_elems", 0))
-    stride = (block_stride or bs * hs, hs, 1) if format_spec.is_mla else None
+    shape, stride = _paged_shape_and_stride(format_spec, shape_desc)
     reconstructed = [
         construct_musa_tensor_from_data_pointer(
             int(pointer.item()),
@@ -638,6 +661,12 @@ class MusaDeviceOps(DeviceOps):
         Raises:
             ValueError: If ``engine_kv_format`` is not supported by the MUSA
                 handle path.
+
+        Notes:
+            Single-plane packed pages retain their complete content width.
+            Dim-0 padded layouts use ``shape_desc.block_stride_elems``;
+            blocked-scale pages are repacked by the torch fallback. These
+            layouts do not use the contiguous native MLA ABI.
         """
         _musa_multi_layer_block_kv_transfer(
             paged_buffer_ptrs_tensor,

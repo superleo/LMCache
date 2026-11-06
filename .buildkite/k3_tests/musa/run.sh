@@ -281,6 +281,7 @@ run_pytest "${PYTEST_ARGS[@]}" \
     tests/v1/platform/devices/musa/test_musa_staging_copy.py \
     tests/v1/platform/devices/musa/test_musa_mp_block_transfer.py::test_musa_block_transfer_device_non_mla_d2h_and_h2d \
     tests/v1/platform/devices/musa/test_musa_mp_block_transfer.py::test_musa_block_transfer_device_mla_d2h_and_h2d \
+    tests/v1/platform/devices/musa/test_glm_kv_transfer.py \
     tests/v1/multiprocess/test_engine_driven_transfer.py::test_musa_data_context_keeps_layout_validation_device_agnostic \
     tests/v1/multiprocess/test_engine_driven_transfer.py::test_musa_data_context_store_uses_device_agnostic_gather \
     tests/v1/multiprocess/test_engine_driven_transfer.py::test_musa_data_context_retrieve_uses_device_agnostic_scatter \

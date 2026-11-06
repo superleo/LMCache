@@ -3,6 +3,7 @@
 
 # Standard
 from types import SimpleNamespace
+import math
 
 # Third Party
 import pytest
@@ -185,4 +186,70 @@ def test_kv_list_pointer_operands_preserve_key_then_value_order(
         (201, (3, 4, 2, 4)),
         (202, (3, 4, 2, 4)),
         (303, (2, 2, 4, 8)),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("fmt", "nh", "width", "shape", "stride"),
+    [
+        (EngineKVFormat.NL_X_NB_BSV_BSS, 1, 132, (3, 4, 132), (1152, 132, 1)),
+        (EngineKVFormat.NL_X_NB_BS_NH_CS, 2, 16, (3, 4, 2, 16), (1152, 32, 16, 1)),
+        (EngineKVFormat.NL_X_NB_NH_BS_CS, 2, 16, (3, 2, 4, 16), (1152, 64, 16, 1)),
+    ],
+)
+@pytest.mark.parametrize("block_stride", [0, 1152])
+def test_glm_pointer_views_preserve_physical_block_stride(
+    monkeypatch: pytest.MonkeyPatch,
+    fmt: EngineKVFormat,
+    nh: int,
+    width: int,
+    shape: tuple[int, ...],
+    stride: tuple[int, ...],
+    block_stride: int,
+) -> None:
+    """MP pointers use full row width and physical stride, not tight page size."""
+    fake_device = SimpleNamespace(type="musa", index=0)
+    calls: list[tuple[int, tuple[int, ...], tuple[int, ...] | None]] = []
+
+    def construct(
+        ptr: int,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: object,
+        *,
+        stride: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        calls.append((ptr, shape, stride))
+        return torch.empty(shape, dtype=dtype)
+
+    monkeypatch.setattr(device_ops, "_as_device", lambda *_args: fake_device)
+    monkeypatch.setattr(
+        device_ops, "construct_musa_tensor_from_data_pointer", construct
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.platform.devices.musa.native_kv_transfer"
+        ".try_native_multi_layer_block_kv_transfer",
+        lambda **_kwargs: True,
+    )
+    desc = PageBufferShapeDesc()
+    desc.nl, desc.nb, desc.bs = 2, 3, 4
+    desc.nh, desc.hs, desc.kv_size = nh, width, 1
+    desc.dtype, desc.element_size = torch.uint8, 1
+    desc.block_stride_elems = block_stride
+    device_ops.MusaDeviceOps().multi_layer_block_kv_transfer(
+        torch.tensor([101, 202], dtype=torch.int64),
+        [303],
+        [1],
+        torch.device("cpu"),
+        TransferDirection.D2H,
+        desc,
+        8,
+        fmt,
+        0,
+    )
+    expected_stride = (block_stride or math.prod(shape[1:]), *stride[1:])
+    assert calls == [
+        (101, shape, expected_stride),
+        (202, shape, expected_stride),
+        (303, (2, 8, nh * width), None),
     ]
