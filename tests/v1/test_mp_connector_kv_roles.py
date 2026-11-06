@@ -51,6 +51,7 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
 )
 from lmcache.integration.vllm.vllm_multi_process_adapter import LoadStoreOp
 from lmcache.utils import CacheStoreEvent  # noqa: E402
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.token_codec import pack_token_ids
 
 pytestmark = pytest.mark.no_shared_allocator
@@ -433,14 +434,24 @@ def test_mla_non_writer_wait_for_save_does_not_create_event(
     scheduler = LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)
     worker = LMCacheMPConnector(config, KVConnectorRole.WORKER)
     scheduler.bind_gpu_block_pool(mock_io.pool)
-    worker.register_kv_caches(mock_io.kv_caches)
     worker.worker_adapter.parallel_strategy = adapter_mod.ParallelStrategy(
-        mla_only=True,
         vllm_world_size=8,
         vllm_worker_id=1,
         tp_size=8,
         pp_size=1,
         n_servers=1,
+    )
+    worker.worker_adapter.register_kv_caches(
+        mock_io.kv_caches,
+        engine_group_infos=[
+            EngineGroupInfo(
+                engine_group_id=0,
+                layer_indices=(0,),
+                tokens_per_block=4,
+                tp_replicas=8,
+            )
+        ],
+        layout_hints={},
     )
     assert worker.worker_adapter.is_kv_writer is False
     worker.worker_adapter.lazy_offload = lazy_offload
