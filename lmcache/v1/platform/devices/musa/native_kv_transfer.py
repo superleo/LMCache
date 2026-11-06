@@ -22,7 +22,6 @@ from lmcache.v1.platform.devices.musa.format_capabilities import (
     is_supported_musa_native_block_transfer_spec,
 )
 from lmcache.v1.platform.ops_types import PageBufferShapeDesc
-from lmcache.v1.platform.torch_ops._kv_format import _BLOCKED_SCALE_BYTES
 from lmcache.v1.platform.torch_ops.mp_mem_kernels import _valid_block_range_indices
 
 if TYPE_CHECKING:
@@ -177,9 +176,11 @@ def _try_strided_native_block_transfer(
     is_blocked = format_spec.requires_blocked_scale_repacking
     value_bytes = scale_bytes = 0
     if is_blocked:
-        scale_bytes = _BLOCKED_SCALE_BYTES
-        value_bytes = row_bytes - scale_bytes
-        if elem != 1 or value_bytes <= 0:
+        try:
+            value_bytes, scale_bytes = format_spec.blocked_scale_geometry(row_bytes)
+        except ValueError:
+            return None
+        if elem != 1:
             return None
 
     block_ids_dev = torch.as_tensor(

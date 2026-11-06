@@ -20,7 +20,6 @@ import torch
 
 # First Party
 from lmcache.lmcache_native import EngineKVFormat, TransferDirection
-from lmcache.v1.gpu_connector.kv_format import get_spec_class
 from lmcache.v1.platform import torch_ops
 from lmcache.v1.platform.base.device_ops import DeviceOps
 from lmcache.v1.platform.devices.musa import native_kv_transfer
@@ -31,6 +30,7 @@ from lmcache.v1.platform.devices.musa.tensor_from_ptr import (
     construct_musa_tensor_from_data_pointer,
 )
 from lmcache.v1.platform.ops_types import PageBufferShapeDesc
+from lmcache.v1.gpu_connector.kv_format import get_spec_class
 
 if TYPE_CHECKING:
     # First Party

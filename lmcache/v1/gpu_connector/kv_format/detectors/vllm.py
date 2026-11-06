@@ -12,6 +12,9 @@ import torch
 from lmcache import torch_device_type
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
+from lmcache.v1.gpu_connector.kv_format.blocked_scale import (
+    resolve_blocked_scale_geometry,
+)
 from lmcache.v1.gpu_connector.kv_format.detectors.base import (
     EngineDetector,
     measure_list_depth_until_tensor,
@@ -44,9 +47,20 @@ def resolve_vllm_kv_layout(
 
 
 def _is_blocked_indexer_plane(t: torch.Tensor) -> bool:
-    """Whether a per-layer plane is the fp8 DSA indexer cache."""
-    # Row: 128 fp8 values + one fp32 scale.
-    return t.dtype == torch.uint8 and int(t.shape[-1]) == 132
+    """Whether a per-layer plane has a supported blocked-scale geometry."""
+    if t.dtype != torch.uint8:
+        return False
+    row_bytes = int(t.shape[-1])
+    # The 584-byte DSV4.1 geometry is currently implemented only by MUSA.
+    # Keep the shared detector from routing it to backends whose blocked-scale
+    # kernels still implement the 132-byte DSV4 contract.
+    if row_bytes == 584 and torch_device_type != "musa":
+        return False
+    try:
+        resolve_blocked_scale_geometry(row_bytes)
+    except ValueError:
+        return False
+    return True
 
 
 class VLLM_Detector(EngineDetector):
