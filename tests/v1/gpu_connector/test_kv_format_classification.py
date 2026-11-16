@@ -170,6 +170,15 @@ def test_blocked_scale_is_distinct_from_regular_mla() -> None:
     assert get_spec_class(F.NL_X_NB_BSV_BSS).requires_blocked_scale_repacking is True
 
 
+def test_blocked_scale_geometry_is_owned_by_its_spec() -> None:
+    """Resolve physical value/scale widths through the format specification."""
+    blocked_spec = get_spec_class(F.NL_X_NB_BSV_BSS)
+    assert blocked_spec.blocked_scale_geometry(584) == (576, 8)
+
+    with pytest.raises(ValueError):
+        get_spec_class(F.NL_X_NB_BS_HS).blocked_scale_geometry(584)
+
+
 def _all_formats():
     return [v for v in vars(F).values() if isinstance(v, F)]
 
